@@ -45,6 +45,7 @@ static const tx_t read_write_tx = UINTPTR_MAX - 11;
 struct segment_node {
     struct segment_node* prev;
     struct segment_node* next;
+    // word memory allocated by library
     // uint8_t segment[] // segment of dynamic size
 };
 typedef struct segment_node* segment_list;
@@ -63,7 +64,7 @@ struct region {
 shared_t tm_create(size_t size, size_t align) {
     struct region* region = (struct region*) malloc(sizeof(struct region));
     if (unlikely(!region)) {
-        return invalid_shared;
+        return invalid_shared; // `NULL`; see line 35 @tm.h
     }
     // We allocate the shared memory buffer such that its words are correctly
     // aligned.
@@ -90,7 +91,7 @@ void tm_destroy(shared_t shared) {
     struct region* region = (struct region*) shared;
     while (region->allocs) { // Free allocated segments
         segment_list tail = region->allocs->next;
-        free(region->allocs);
+        free(region->allocs);  // recursively free heads
         region->allocs = tail;
     }
     free(region->start);
@@ -132,31 +133,35 @@ tx_t tm_begin(shared_t shared, bool is_ro) {
         // and to optimize the code with this additional knowledge.
         // It of course penalizes executions in which the condition turns up to
         // be true.
-        if (unlikely(!shared_lock_acquire_shared(&(((struct region*) shared)->lock))))
+        if (unlikely(!shared_lock_acquire_shared(&( ((struct region*) shared)->lock ))))
             return invalid_tx;
-        return read_only_tx;
-    } else {
+        return read_only_tx; // see line 39
+    }
+    else {
         if (unlikely(!shared_lock_acquire(&(((struct region*) shared)->lock))))
             return invalid_tx;
-        return read_write_tx;
+        return read_write_tx; // see line 40
     }
 }
 
 bool tm_end(shared_t shared, tx_t tx) {
     if (tx == read_only_tx) {
-        shared_lock_release_shared(&(((struct region*) shared)->lock));
-    } else {
-        shared_lock_release(&(((struct region*) shared)->lock));
+        shared_lock_release_shared(&( ((struct region*) shared)->lock ));
+    }
+    else {
+        shared_lock_release(&( ((struct region*) shared)->lock ));
     }
     return true;
 }
 
 // Note: "unused" is a macro that tells the compiler that a variable is unused.
+// `source` in transactional memory
 bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* source, size_t size, void* target) {
     memcpy(target, source, size);
     return true;
 }
 
+// `target` in transactional memory
 bool tm_write(shared_t unused(shared), tx_t unused(tx), void const* source, size_t size, void* target) {
     memcpy(target, source, size);
     return true;
@@ -167,7 +172,7 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) {
     // aligned. Moreover, the alignment of the 'next' and 'prev' pointers must
     // be satisfied. Thus, we use align on max(align, struct segment_node*).
     size_t align = ((struct region*) shared)->align;
-    align = align < sizeof(struct segment_node*) ? sizeof(void*) : align;
+    align = align < sizeof(struct segment_node*) ? sizeof(void*) : align; // !
 
     struct segment_node* sn;
     if (unlikely(posix_memalign((void**)&sn, align, sizeof(struct segment_node) + size) != 0)) // Allocation failed
@@ -176,7 +181,9 @@ alloc_t tm_alloc(shared_t shared, tx_t unused(tx), size_t size, void** target) {
     // Insert in the linked list
     sn->prev = NULL;
     sn->next = ((struct region*) shared)->allocs;
-    if (sn->next) sn->next->prev = sn;
+    if (sn->next) {
+        sn->next->prev = sn;
+    }
     ((struct region*) shared)->allocs = sn;
 
     void* segment = (void*) ((uintptr_t) sn + sizeof(struct segment_node));
@@ -189,10 +196,15 @@ bool tm_free(shared_t shared, tx_t unused(tx), void* segment) {
     struct segment_node* sn = (struct segment_node*) ((uintptr_t) segment - sizeof(struct segment_node));
 
     // Remove from the linked list
-    if (sn->prev) sn->prev->next = sn->next;
-    else ((struct region*) shared)->allocs = sn->next;
-    if (sn->next) sn->next->prev = sn->prev;
-
+    if (sn->prev) {
+        sn->prev->next = sn->next;
+    }
+    else { // head of segment_list
+        ((struct region*) shared)->allocs = sn->next;
+    }
+    if (sn->next) {
+        sn->next->prev = sn->prev;
+    }
     free(sn);
     return true;
 }
