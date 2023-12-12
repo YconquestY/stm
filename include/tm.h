@@ -39,7 +39,7 @@ static shared_t const invalid_shared = NULL; // Invalid shared memory region
 // transactions, or an address (e.g., if you created an associated data
 // structure).
 typedef uintptr_t tx_t; // The type of a transaction identifier
-static tx_t const invalid_tx = ~((tx_t) 0); // Invalid transaction constant
+static tx_t const invalid_tx = ~((tx_t) 0); // Invalid transaction constant: MAX_UINTPTR_T
 
 typedef int alloc_t;
 static alloc_t const success_alloc = 0; // Allocation successful and the TX can continue
