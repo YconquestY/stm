@@ -25,14 +25,31 @@
  *     2. Use `atomic_flag` as lock
  *     3. TX operation history utilities
 **/
-
 #pragma once
 
+// Requested features
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#define _POSIX_C_SOURCE   200809L
+#ifdef __STDC_NO_ATOMICS__
+    #error Current C11 compiler does not support atomic operations
+#endif
+
+// External headers
+#include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <pthread.h>
+
+// Internal headers
+#include <tm.h>
+//#include "tm.h"
+
+#include "macros.h"
 
 /********************************
  * 0. Constants and definitions *
@@ -44,16 +61,16 @@
 // an `uint64_t`. The MSB signals if a word is written, and the remaining 63b
 // act as a bitmap, each representing a R/W TX. Extra R/W TX will be rejected
 // when calling `tm_begin`.
-#define MAX_RW_TX 64 - 1
+#define MAX_RW_TX 63
 // Max no. of segments per region (actually 63)
 #define MAX_SEG   64
 #define FIRST_SEG 1
 
 #define SHIFT        48
-#define NOMEM        0x1000 0000 0000 0000
-#define SEG_OVERFLOW 0x0100 0000 0000 0000
-#define ADDR_OFFSET  0x0000 FFFF FFFF FFFF
-#define WRITTEN      0x8000 0000 0000 0000
+#define NOMEM        0x1000000000000000 // Only first hex digit set
+#define SEG_OVERFLOW 0x0100000000000000 // Only second hex digit set
+#define ADDR_OFFSET  0x0000FFFFFFFFFFFF // Least 48b set
+#define WRITTEN      0x8000000000000000 // MSB set
 
 /**
  * @brief Thread batcher.
@@ -65,7 +82,7 @@ struct batcher_t {
     uint64_t remaining; // No. of unfinished threads in current epoch
     uint64_t blocked;   // No. of waiting threads, to be executed in next epoch
     pthread_mutex_t lock;
-    pthread_cond_t  cond;
+    pthread_cond_t cond;
 };
 
 /**
@@ -83,14 +100,14 @@ struct segment_node
     // However, it seems to be a must to traverse the linked list to swap word
     // copies when building a new snopshot at epoch end. Hence, segment
     // deregistration is trivially combined with snapshot construction.
-    atomic_flag freed;   // Confirmed to be freed
-    atomic_flag written; // Confirmed to have been written
+    atomic_bool freed;   // Confirmed to be freed
+    atomic_bool written; // Confirmed to have been written
     
     atomic_flag* aset_locks; // Per-word "access set" guard
     uint64_t* aset;          // Per-word "access set" and written? flag
     // TODO: feasible to fix version?
-    int version; // RO version; 0: A; 1: B
-    void* copies[2]; // copies[0]: A; copies[1]: B
+    void* ro;
+    void* rw;
     // word allocated at runtime
 };
 typedef struct segment_node* segment_list;
@@ -107,7 +124,7 @@ struct rwop {
 
 struct afop {
     uint8_t seg_id;
-}
+};
 
 struct record
 {
@@ -117,7 +134,7 @@ struct record
         struct rwop rwop; // `tm_read` or `tm_write`
         struct afop afop; // `tm_alloc` or `tm_free`
     };
-}
+};
 
 /**
  * @brief Write record for rollback.
@@ -155,7 +172,6 @@ struct region
     shared_t start; // Pointer to first word of first segment
     size_t size;    // Size of first segment
     size_t align;   // Global alignment, i.e., size of a word
-    size_t _align;  // Alignment except for first segment; may equal `align`
     // The no. of all segments (including the non-free-able one) is capped at
     // `MAX_SEG`, i.e., 63. The fundamental reason is that I want to deduce
     // which segment a generic TX accesses given an opaque `void*` pointer. A
@@ -252,9 +268,9 @@ int batcher_get_epoch(struct batcher_t* batcher);
 /** Wait and enter a batch.
  * @param batcher Thread batch to enter
  * @param is_ro   Whether the TX is read-only
- * @return TX ID; -1 if R/W TX no. exceeds `MAX_RW_TX`
+ * @return TX ID; `invalid_tx` if R/W TX no. exceeds `MAX_RW_TX`
 **/
-int batcher_enter(struct batcher_t* batcher, bool is_ro);
+tx_t batcher_enter(struct batcher_t* batcher, bool is_ro);
 
 /**
  * @brief Leave the current batch.
@@ -286,12 +302,12 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed);
 /** Acquire spinlock.
  * @param lock Pointer to atomic flag
 **/
-static inline void acquire(atomic_flag* lock);
+/*static inline*/ void acquire(atomic_flag* lock);
 
 /** Release spinlock.
  * @param lock Pointer to atomic flag
 **/
-static inline void release(atomic_flag* lock);
+/*static inline*/ void release(atomic_flag* lock);
 
 /*************************************
  * 3. TX operation history utilities *

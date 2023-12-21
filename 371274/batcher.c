@@ -23,7 +23,7 @@
 
 //#include <stdbool.h>
 
-#include <tm.h>
+//#include <tm.h>
 
 #include "macros.h"
 #include "batcher.h"
@@ -52,55 +52,47 @@ int batcher_get_epoch(struct batcher_t* batcher) {
     return batcher->counter;
 }
 
-/**
- * @brief Get TX ID.
- * 
- * @param batcher Thread batcher to enter
- * @param is_ro   Whether the TX is read-only
- * @return TX ID; `invalid_tx` if R/W TX no. exceeds `MAX_RW_TX`
-**/
-static inline tx_t get_tx_id(struct batcher_t* batcher, bool is_ro)
-{
-    if (is_ro) {
-        return batcher->ro_tx++;
-    }
-    // R/W TX
-    else if (unlikely(batcher->rw_tx >= MAX_RW_TX)) {
-        return invalid_tx;
-    }
-    else {
-        return batcher->rw_tx++;
-    }
-}
-
 // Unlike the reference implementation, `batcher_enter` returns the calling TX's
 // ID:
 //     < `MAX_RW_TX`: R/W TX
 //     `invalid_tx` : R/W TX rejected; R/W TX no. capped at `MAX_RW_TX`
 //     ≥ `MAX_RW_TX`: RO  TX
 tx_t batcher_enter(struct batcher_t* batcher, bool is_ro)
-{   // Batcher lock must be acquired before getting TX ID. This is because
+{
+    tx_t tx_id;
+    // Batcher lock must be acquired before getting TX ID. This is because
     // `get_tx_id(…)` may modify `rw_tx` and `ro_tx`.
     pthread_mutex_lock(&batcher->lock);
-
-    tx_t tx_id = get_tx_id(batcher, is_ro);
-    // Short circuit if TX invalid
-    if (unlikely(tx_id == invalid_tx)) {
-        pthread_mutex_unlock(&batcher->lock);
-        return invalid_tx;
-    }
+    uint64_t _counter = batcher->counter;
     // I assumed that the grader stress-tests the STM library, requesting a lot
     // of memory operations. Hence, I tuned the zero-in-epoch-op condition as
     // unlikely, and the epoch-unfinished condition as likely.
     if (unlikely(batcher->remaining == 0)) { // First epoch: only 1 thread in batch
+        //printf("epoch: %lu\n", _counter);
+        tx_id = is_ro ? (uint64_t) MAX_RW_TX : (uint64_t) 0;
         batcher->remaining = 1;
+        //printf("epoch: %lu\ttx: %lu\texecutes\n", _counter, tx_id);
     }
     else
-    {
+    {   // Determine TX ID
+        if (is_ro) {
+            tx_id = batcher->ro_tx++;
+        }
+        else if (unlikely(batcher->rw_tx >= MAX_RW_TX)) {
+            pthread_mutex_unlock(&batcher->lock);
+            //printf("epoch: %lu\tabort\n", _counter + 1);
+            return invalid_tx;
+        }
+        else {
+            tx_id = batcher->rw_tx++;
+        }
         batcher->blocked++;
-        while (likely(batcher->remaining > 0)) {
+        //printf("epoch: %lu\tblocked: %lu\n", batcher->counter, batcher->blocked);
+        while (likely(_counter == batcher->counter)) {
+            //printf("epoch: %lu\ttx: %lu\twaits\n", _counter + 1, tx_id);
             pthread_cond_wait(&batcher->cond, &batcher->lock);
         }
+        //printf("tx: %lu\twoken\n", tx_id);
     }
     pthread_mutex_unlock(&batcher->lock);
     return tx_id;
@@ -108,86 +100,93 @@ tx_t batcher_enter(struct batcher_t* batcher, bool is_ro)
 
 void batcher_leave(shared_t shared, tx_t tx, bool committed)
 {
+    //printf("tx: %lu\t%s\n", tx, committed ? "commits" : "aborts");
     struct region* region = (struct region*) shared;
-    // Handle history
+    struct batcher_t* batcher = &region->batcher;
+    // Handle R/W TX history
     // `tx` can never be `invalid_tx`. Invalid TXs "die" when calling
     // `tm_begin` and never enter the batch.
-    struct record* r = region->history[tx];
-    struct record* next;
-    while (r) // R/W TX: Non-empty history
+    if (tx < MAX_RW_TX) // RO TX has no history.
     {
-        switch (r->type)
+        struct record* r = region->history[tx];
+        struct record* next;
+        while (r != NULL) // R/W TX: Non-empty history
         {
-            case READ:
-                if (!(committed))
-                {
-                    size_t start_idx = r->rwop.offset / region->align;
-                    size_t end_idx = (r->rwop.offset + r->rwop.size) / region->align;
-                    // Acquire per-word "access set" lock
-                    for (size_t word_idx = start_idx; word_idx < end_idx; word_idx++) {
-                        acquire(&(region->allocs[r->rwop.seg_id]->aset[word_idx]));
+            switch (r->type)
+            {
+                case READ:
+                    if (!(committed))
+                    {
+                        size_t start_idx = r->rwop.offset / region->align;
+                        size_t num_words = r->rwop.size / region->align;
+                        // Acquire per-word "access set" lock
+                        for (size_t word_idx = start_idx; word_idx < start_idx + num_words; word_idx++) {
+                            acquire(&( region->allocs[r->rwop.seg_id]->aset_locks[word_idx] ));
+                        }
+                        // Reset per-word "access set"
+                        for (size_t word_idx = start_idx; word_idx < start_idx + num_words; word_idx++) {
+                            region->allocs[r->rwop.seg_id]->aset[word_idx] &= ~((uint64_t) 1 << tx);
+                        }
+                        // Release per-word "access set" lock
+                        for (size_t word_idx = start_idx; word_idx < start_idx + num_words; word_idx++) {
+                            release(&( region->allocs[r->rwop.seg_id]->aset_locks[word_idx] ));
+                        }
                     }
-                    // Reset per-word "access set"
-                    for (size_t word_idx = start_idx; word_idx < end_idx; word_idx++) {
-                        region->allocs[r->rwop.seg_id].aset[word_idx] &= ~(1 << tx);
+                    break;
+                case WRITE:
+                    if (committed) {
+                        atomic_store(&(region->allocs[r->rwop.seg_id]->written), true);
                     }
-                    // Release per-word "access set" lock
-                    for (size_t word_idx = start_idx; word_idx < end_idx; word_idx++) {
-                        release(&(region->allocs[r->rwop.seg_id]->aset[word_idx]));
+                    else
+                    {
+                        struct segment_node* sn = region->allocs[r->rwop.seg_id];
+                        void* ro_addr = (void*) ((uintptr_t) sn->ro + r->rwop.offset); // RO  address
+                        void* rw_addr = (void*) ((uintptr_t) sn->rw + r->rwop.offset); // R/W address
+                        size_t start_idx = r->rwop.offset / region->align;
+                        size_t num_words = r->rwop.size / region->align;
+                        // Acquire per-word "access set" lock
+                        for (size_t word_idx = start_idx; word_idx < start_idx + num_words; word_idx++) {
+                            acquire(&(sn->aset_locks[word_idx]));
+                        }
+                        memcpy(rw_addr, ro_addr, r->rwop.size); // Rollback words from RO to R/W
+                        // // Reset per-word "access set"
+                        // // It is safe to reset "access sets" to 0. No other TX can
+                        // // access the word after is has been written. Hence, the
+                        // // only pattern of `aset[…]` is
+                        // //     0b1000 0000…0010…0000
+                        // //       ^ Written   ^ TX that wrote
+                        // memset(sn->aset + start_idx * sizeof(uint64_t), 0, num_words * sizeof(uint64_t));
+                        for (size_t word_idx = start_idx; word_idx < start_idx + num_words; word_idx++) {
+                            sn->aset[word_idx] &= ~(WRITTEN & ((uint64_t) 1 << tx));
+                        }
+                        // Release per-word "access set" lock
+                        for (size_t word_idx = start_idx; word_idx < start_idx + num_words; word_idx++) {
+                            release(&(sn->aset_locks[word_idx]));
+                        }
                     }
-                }
-                break;
-            case WRITE:
-                if (committed) {
-                    atomic_flag_test_and_set(&(region->allocs[r->rwop.seg_id]->written));
-                }
-                else
-                {
-                    struct segment_node* sn = region->allocs[r->rwop.seg_id];
-                    void* ro_addr = (void*) ((uintptr_t) sn->copies[sn->version]     + r->rwop.offset); // RO  address
-                    void* rw_addr = (void*) ((uintptr_t) sn->copies[1 - sn->version] + r->rwop.offset); // R/W address
-                    size_t start_idx = r->rwop.offset / region->align;
-                    size_t end_idx = (r->rwop.offset + r->rwop.size) / region->align;
-                    // Acquire per-word "access set" lock
-                    // TODO: must acquire per-word lock before rollback?
-                    for (size_t word_idx = start_idx; word_idx < end_idx; word_idx++) {
-                        acquire(&(sn->aset[word_idx]));
+                    break;
+                case ALLOC:
+                    if (unlikely(!(committed))) {
+                        atomic_store(&(region->allocs[r->afop.seg_id]->freed), true);
+                        //printf("tx %lu marks segment %u\n", tx, r->afop.seg_id);
                     }
-                    memcpy(rw_addr, ro_addr, r->rwop.size); // Rollback words from RO to R/W
-                    // Reset per-word "access set"
-                    // It is safe to reset "access sets" to 0. No other TX can
-                    // access the word after is has been written. Hence, the
-                    // only pattern of `aset[…]` is
-                    //     0b1000 0000…0010…0000
-                    //       ^ Written   ^ TX that wrote
-                    memset(sn->aset + start_idx, 0, (end_idx - start_idx) * sizeof(uint64_t));
-                    // Release per-word "access set" lock
-                    for (size_t word_idx = start_idx; word_idx < end_idx; word_idx++) {
-                        release(&(sn->aset[word_idx]));
+                    break;
+                case FREE:
+                    if (committed) {
+                        atomic_store(&(region->allocs[r->afop.seg_id]->freed), true);
+                        //printf("tx %lu marks segment %u\n", tx, r->afop.seg_id);
                     }
-                }
-                break;
-            case ALLOC:
-                if (unlikely(!(committed))) {
-                    atomic_flag_test_and_set(&(region->allocs[r->afop.seg_id]->freed));
-                }
-                break;
-            case FREE:
-                if (committed) {
-                    atomic_flag_test_and_set(&(region->allocs[r->afop.seg_id]->freed));
-                }
-                break;
-            default:
-                break;
+                    break;
+                default:
+                    break;
+            }
+            // Clear record
+            next = r->next;
+            free(r);
+            r = next;
         }
-    // Clear record
-        next = r->next;
-        free(r);
-        r = next;
     }
-    region->history[tx] = NULL;
     // Leave batch
-    struct batcher_t batcher = region->batcher;
     pthread_mutex_lock(&batcher->lock);
     // The case where `batcher_enter` determines `remaining` is 0 will not
     // happen becasue the lock is not yet released.
@@ -201,55 +200,61 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
         {
             sn = region->allocs[i]; // Pointer to segment
             // Short circuit if segment does not exist
-            if (!(sn)) {
+            if (sn == NULL) {
                 continue;
             }
-            if (atomic_flag_test_and_set(&(sn->freed))) // Segment confirmed freed
-            {
-                region->segment_id[--region->top] = i; // Put segment ID back atop stack
+            if (atomic_load(&(sn->freed))) // Segment confirmed freed
+            {   // Put segment ID back atop stack
+                region->segment_id[--region->top] = i; // Only 1 thread left, no data race
                 // Free segment
+                free(sn->aset_locks);
+                free(sn->aset);
+                free(sn->ro);
+                free(sn->rw);
                 free(sn);
-                region->allocs[i] = NULL;
+                region->allocs[i] = NULL; // Deregister segment from region
+                //printf("segment %u freed\n", i);
             }
             else // Segment not freed; may have been written
             {
                 size_t num_words = sn->size / region->align;
-                // Segment confirmed written
-                // TODO: word swap optimization
-                if (atomic_flag_test_and_set(&(sn->written)))
+                // // Segment confirmed written
+                // // TODO: word swap optimization
+                if (atomic_load(&(sn->written)))
                 {   // Reset written? flag
-                    atomic_flag_clear(&(sn->written));
+                    atomic_store(&(sn->written), false);
                     
-                    size_t start, end; // Interval [`start`,`end`) written
-                    for (size_t word_idx = 0; word_idx < num_words; /* inside loop body */)
-                    {
-                        if (sn->aset[word_idx] > WRITTEN) // Word written
-                        {   // Find written word interval
-                            start = word_idx;
-                            while ((sn->aset[word_idx] > WRITTEN) && (word_index < num_words)) {
-                                word_idx++;
-                            }
-                            end = word_idx;
-                            // Swap word copies
-                            memcpy((void*) ((uintptr_t) sn->copies[version]   + start * region->align), // To   RO  version
-                                   (void*) ((uintptr_t) sn->copies[1-version] + start * region->align), // From R/W version
-                                   (end - start) * region->align);
-                        }
-                        else {
-                            word_idx++;
-                        }
-                    }
-                    sn->version = 1 - sn->version; // Update version; must happen after word swap
+                    // size_t start, end; // Interval [`start`,`end`) written
+                    // for (size_t word_idx = 0; word_idx < num_words; /* inside loop body */)
+                    // {
+                    //     if (sn->aset[word_idx] > WRITTEN) // Word written
+                    //     {   // Find written word interval
+                    //         start = word_idx;
+                    //         while ((sn->aset[word_idx] > WRITTEN) && (word_idx < num_words)) {
+                    //             word_idx++;
+                    //         }
+                    //         end = word_idx;
+                    //         // Swap word copies
+                    //         memcpy((void*) ((uintptr_t) sn->ro + start * region->align), // To   RO  version
+                    //                (void*) ((uintptr_t) sn->rw + start * region->align), // From R/W version
+                    //                (end - start) * region->align); // No need to acquire lock: only 1 thread left
+                    //     }
+                    //     else {
+                    //         word_idx++;
+                    //     }
+                    // }
+                    memcpy(sn->ro, sn->rw, sn->size);
                 }
                 memset(sn->aset, 0, num_words * sizeof(uint64_t)); // reset "access set" no matter if the segment is written
             }
         }
+        memset(region->history, 0, MAX_RW_TX * sizeof(struct record*)); // Reset TX history
         batcher->counter++;         // Set next epoch ID
-        batcher->rw_tx = 0;         // Reset R/W TX counter
-        batcher->ro_tx = MAX_RW_TX; // Reset RO  TX counter
-        batcher->remaining = batcher->blocked;
-        batcher->blocked = 0; // Better run before signaling waiting threads;
-                              //     must reset before releasing lock
+        batcher->rw_tx = 0;         // Reset R/W TX ID
+        batcher->ro_tx = MAX_RW_TX; // Reset RO  TX ID
+        batcher->remaining = batcher->blocked; // Better set before waking up threads
+        batcher->blocked = 0; // Must reset before releasing lock
+        //printf("epoch: %lu\n", batcher->counter);
         pthread_cond_broadcast(&batcher->cond);
     }
     pthread_mutex_unlock(&batcher->lock);
@@ -259,11 +264,11 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
  * 2. Use `atomic_flag` as lock *
  ********************************/
 
-static inline void acquire(atomic_flag* lock) {
+/*static inline*/ void acquire(atomic_flag* lock) {
     while (atomic_flag_test_and_set(lock)); // Spin
 }
 
-static inline void release(atomic_flag* lock) {
+/*static inline*/ void release(atomic_flag* lock) {
     atomic_flag_clear(lock);
 }
 
@@ -276,8 +281,9 @@ struct record* rw(op_t type,
                   size_t align)
 {
     struct record *r;
-    posix_memalign((void**) &r, align, sizeof(struct record)); // Assume no failure due to small size
-
+    if (unlikely(posix_memalign((void**) &r, align, sizeof(struct record)) != 0)) {
+        return NULL;
+    }
     r->type = type;
     r->next = NULL;
     r->rwop.seg_id = seg_id;
@@ -290,8 +296,9 @@ struct record* rw(op_t type,
 struct record* af(op_t type, uint8_t seg_id, size_t align)
 {
     struct record* r;
-    posix_memalign((void**) &r, align, sizeof(struct record)); // Assume no failure due to small size
-
+    if (unlikely(posix_memalign((void**) &r, align, sizeof(struct record)) != 0)) {
+        return NULL;
+    }
     r->type = type;
     r->next = NULL;
     r->afop.seg_id = seg_id;
@@ -302,17 +309,15 @@ struct record* af(op_t type, uint8_t seg_id, size_t align)
 void clear_history(shared_t shared)
 {
     struct region* region = (struct region*) shared;
-    struct record* r, next;
+    struct record* r;
+    struct record* next;
     for (uint8_t i = 0; i < MAX_RW_TX; i++)
     {
-        if (region->history[i]) // Linked list exists
-        {
-            r = region->history[i];
-            while (r) {
-                next = r->next;
-                free(r);
-                r = next;
-            }
+        r = region->history[i];
+        while (r != NULL) {
+            next = r->next;
+            free(r);
+            r = next;
         }
     }
 }
