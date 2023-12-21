@@ -18,9 +18,11 @@
  * 
  * @section DESCRIPTION
  * 
- * This file is named `batcher.h` because it is the primary part. The full
- * contents are listed below.
- *     0. Constant definitions and DV-STM component declarations
+ * Although named `batcher.h`, this file also include utilities other than the
+ * thread batcher.
+ * 
+ * Table of contents
+ *     0. Constants and DV-STM components
  *     1. Thread batcher utilities
  *     2. Use `atomic_flag` as lock
  *     3. TX operation history utilities
@@ -47,13 +49,12 @@
 
 // Internal headers
 #include <tm.h>
-//#include "tm.h"
 
 #include "macros.h"
 
-/********************************
- * 0. Constants and definitions *
- ********************************/
+/*********************************
+ * 0. Constants and declarations *
+ *********************************/
 
 // Max no. of R/W TX per batch
 // The fundamental reason of confining the max. no. of R/W TX per batch is the
@@ -62,7 +63,7 @@
 // act as a bitmap, each representing a R/W TX. Extra R/W TX will be rejected
 // when calling `tm_begin`.
 #define MAX_RW_TX 63
-// Max no. of segments per region (actually 63)
+// Max no. of segments per region (actually 63 because 0th slot unused)
 #define MAX_SEG   64
 #define FIRST_SEG 1
 
@@ -76,108 +77,90 @@
  * @brief Thread batcher.
  */
 struct batcher_t {
-    uint64_t counter; // Current epoch ID
-    tx_t rw_tx; // R/W TX ID from 0 to `MAX_RW_TX` - 1; -1: extra R/W TX rejected
+    uint64_t counter; // Current epoch
+    tx_t rw_tx; // R/W TX ID from 0 to `MAX_RW_TX` - 1; `invalid_tx`: extra R/W TX rejected
     tx_t ro_tx; // RO  TX ID from `MAX_RW_TX`; no no. limit
-    uint64_t remaining; // No. of unfinished threads in current epoch
+    uint64_t remaining; // No. of outstanding threads in current epoch
     uint64_t blocked;   // No. of waiting threads, to be executed in next epoch
     pthread_mutex_t lock;
     pthread_cond_t cond;
 };
 
 /**
- * @brief List of dynamically allocated segments.
+ * @brief A (dynamically allocated) segment and its control metadata.
  * 
- * `segment_node` and `region` are moved here so that `batcher_leave` may
- * continue `tm_free`ing marked segments.
+ * `segment_node` and `region` are moved here so that `batcher_leave` 
+ * recognizes these constructs.
 **/
 struct segment_node
 {   // Segment ID; no more than `MAX_SEG`
-    uint8_t seg_id; // First segment has ID 1
+    uint8_t seg_id; // First segment has ID `FIRST_SEG`, i.e., 1; futile?
     size_t size;    // Segment size
-    // Whether to free segment at epoch end
-    // Traversing the linked list of segments to free memory is not efficient.
-    // However, it seems to be a must to traverse the linked list to swap word
-    // copies when building a new snopshot at epoch end. Hence, segment
-    // deregistration is trivially combined with snapshot construction.
-    atomic_bool freed;   // Confirmed to be freed
-    atomic_bool written; // Confirmed to have been written
+    
+    atomic_bool freed;   // Confirmed to be freed at epoch end
+    atomic_bool written; // Confirmed to have been written at epoch end
     
     atomic_flag* aset_locks; // Per-word "access set" guard
     uint64_t* aset;          // Per-word "access set" and written? flag
-    // TODO: feasible to fix version?
-    void* ro;
-    void* rw;
-    // word allocated at runtime
+    void* ro; // Read-only  copy
+    void* rw; // Read/write copy
 };
 typedef struct segment_node* segment_list;
 
+/**
+ * @brief Op type per record (TX op).
+**/
 typedef
 enum {READ, WRITE, ALLOC, FREE}
 op_t;
 
+/**
+ * @brief `tm_read`/`tm_write` record.
+**/
 struct rwop {
     uint8_t seg_id;
     size_t  offset;
     size_t  size;
 };
 
+/**
+ * @brief `tm_alloc`/`tm_free` record.
+**/
 struct afop {
     uint8_t seg_id;
 };
 
+/**
+ * @brief A R/W TX op record.
+ * 
+ * TODO: how does `posix_memalign` behave for `struct` with `union`?
+ */
 struct record
 {
     op_t type;
     struct record* next;
     union {
-        struct rwop rwop; // `tm_read` or `tm_write`
+        struct rwop rwop; // `tm_read`  or `tm_write`
         struct afop afop; // `tm_alloc` or `tm_free`
     };
 };
 
 /**
- * @brief Write record for rollback.
- * 
- * A write history comprises multiple write records. Written intervals may
- * overlap, in which case they may be rolled back multiple times. I do not
- * handle such an uncommon case. Just make it correct.
-**/
-/*
-struct wrecord {
-    uint8_t seg_id; // Segment ID
-    size_t offset;  // Offset against segment start
-    size_t size;    // Write size
-    struct wrecord* next;
-};
-*/
-/**
- * @brief Free record.
- * 
- * A free history comprises multiple free records.
-**/
-/*
-struct frecord {
-    uint8_t seg_id; // Segment ID
-    struct frecord* next;
-};
-*/
-/**
  * @brief Shared memory region, a.k.a. transactional memory.
 **/
 struct region
-{
+{   // Thread batcher
     struct batcher_t batcher;
     // Non-free-able first segment
     shared_t start; // Pointer to first word of first segment
     size_t size;    // Size of first segment
     size_t align;   // Global alignment, i.e., size of a word
     // The no. of all segments (including the non-free-able one) is capped at
-    // `MAX_SEG`, i.e., 63. The fundamental reason is that I want to deduce
+    // `MAX_SEG` (actually 63). The fundamental reason is that I want to deduce
     // which segment a generic TX accesses given an opaque `void*` pointer. A
     // generic pointer, a.k.a. `void*`, is 8B long. Any segment is no longer
-    // than 2^48B, whose addresses are representable by 6B. Using opaque
-    // addresses, a `void*` ranges
+    // than 2^48B, whose addresses are representable by 6B. Therefore, I
+    // defined another abstraction of opaque address: a `void*` ranges
     //     from 0x#### 0000…0000
     //     to   0x#### FFFF…FFFF.
     // The highest 2B is wasted! Hence, I use second highest 1B (actually 6b)
@@ -203,45 +186,49 @@ struct region
     //     Assigned ID:     1      2      3      4                      2,
     // Valid segment IDs are 1, 2, and 4; `top` is 4; `segment_id` is
     //     {0, 1, 2, 2, 3, 5, …， 63}
-    //                  ^ stack top
+    //                  ^ Stack top
     // Obviously, `segment_id` may not store consecutive IDs in that freed IDs
     // are pushed back atop.
     uint8_t top;
     uint8_t segment_id[MAX_SEG]; // Stack for segment IDs; `segment_id[1]` is stack top
-    struct segment_node* allocs[MAX_SEG]; // All segments
-    // TODO: update comment
-    // All ops, including reading the same word, will be rolled
-    // back. It does not matter if there is a read after writes,
-    // e.g.,
-    //     TX: W W … W R W A
-    //     
-    // interval overlap
-    struct record* history[MAX_RW_TX];
-    // Log for write rollback
-    // Each region centrally manages per-TX rollback. Consider the same words
-    // accessed by
-    //     TX | Trace
-    //      I | W W … R W
-    //     II |           R W
-    // Note that
-    // 1. One cannot defer writes to epoch end because
-    //    1.1 Writes are from temporary buffers in library user memory.
+    struct segment_node* allocs[MAX_SEG]; // All segments    
+    // Per-TX op history
+    // While RO TXs always commit, a R/W TX may abort, and any op of the TX
+    // prior to the abort point must be rolled back. Hence, per-TX history is
+    // necessary for op rollback. Now that no. of R/W TXs is capped at
+    // `MAX_RW_TX`, the history is centrally managed per region. History of
+    // each R/W TX is a linked list of records. Note that
+    // 1. Rollback is absolutely necessary.
+    //    One cannot simply ignore a TX's mess after aborting it. Consider the
+    //    case
+    //        TX | Trace
+    //         I | W W … R W
+    //        II |           R W
+    //    Suppose all ops but the last write of TX I commits. TX I aborts. All
+    //    previous writes must be rolled back. Otherwise,
+    //    1.1 atomicity would be violated;
+    //    1.2 TX II would abort, which could have committed.
+    // 2. All R/W TX ops, including `tm_read(…)` and `tm_alloc(…)`, may be
+    //    rolled back.
+    // 3. Lazy execution seems infeasible.
+    //    3.1 Writes are from temporary buffers in library user memory.
     //        Contents of the buffers may have changed when the R/W TX commits.
-    //    1.2 (Point 3 of snapshot isolation) TX I has a read in the end. If
+    //    3.2 Consider the case
+    //            TX: W W … R W (assume same location)
+    //        (Point 3 of snapshot isolation) TX has a read in the end. If
     //        the read targets a previously written word, writes cannot be
     //        deferred. This is because a TX must see its own modifcations.
-    // 2. It seems impossible to avoid write rollback. Suppose all ops but the
-    //    last write of TX I succeeds. TX I aborts. All previous writes must be
-    //    rolled back. Otherwise, atomicity will be violated.
-    // 3. When rolling back writes, copy from RO to R/W versions. It is
-    //    infeasible to "remember" initial contents of the R/W version alone.
-    // 4. Do not write to both copies of memory words. There may be outstanding
+    // 4. When rolling back writes, copy from RO to R/W versions. It is
+    //    infeasible to "remember" initial contents of the R/W version.
+    // 5. Do not write to both copies of memory words. There may be outstanding
     //    RO TXs after the R/W TX.
-    //bool write[MAX_RW_TX]; // Whether a segment is written before a TX commits;
-    //struct wrecord* whistory[MAX_RW_TX];
-    // Each region centrally manages per-TX segment deregistration.
-    //bool mark[MAX_RW_TX]; // Whether a segment is marked for deregistration;
-    //struct frecord* fhistory[MAX_RW_TX];
+    // 6. If there are multiple accesses to the same word in a R/W TX, the
+    //    history will contain repetitive records. Then the same word will be
+    //    rolled back multiple times. Although inefficient, I do not optimize
+    //    it because this is the uncommon case. It is insane for a library user
+    //    to keep reading/writing the same exact word!
+    //        "Make the common case fast; make the uncommon case correct."
+    struct record* history[MAX_RW_TX];
 };
 
 /*********************
@@ -258,12 +245,6 @@ bool batcher_init(struct batcher_t* batcher);
  * @param batcher Thread batcher to clean up
 **/
 void batcher_cleanup(struct batcher_t* batcher);
-
-/** Get epoch ID.
- * @param batcher Thread batcher to get epoch ID from
- * @return Epoch ID
-**/
-int batcher_get_epoch(struct batcher_t* batcher);
 
 /** Wait and enter a batch.
  * @param batcher Thread batch to enter
@@ -335,13 +316,3 @@ struct record* af(op_t type, uint8_t seg_id, size_t align);
  * @param shared Shared memory region to get history from
 **/
 void clear_history(shared_t shared);
-
-/** Clear up write history.
- * @param shared Shared memory region to clear up per-TX write history from
-**/
-//void clear_whistory(shared_t shared);
-
-/** Clear up free history.
- * @param shared Shared memory region to clear up per-TX free history from
-**/
-//void clear_fhistory(shared_t shared);

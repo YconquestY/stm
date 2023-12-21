@@ -29,10 +29,6 @@
 #endif
 
 // External headers
-//#include <stdint.h>
-//#include <stdbool.h>
-//#include <string.h>
-//#include <stdatomic.h>
 //#include <immintrin.h> // SIMD intrinsics
 
 // Internal headers
@@ -46,62 +42,70 @@
  * 
  * @param shared Shared memory region to allocate a segment in
  * @param size   Allocation requested size (in bytes), must be a positive multiple of the alignment
+ * @param align  Alignment (in bytes), must be a power of 2
  * @param first  Whether this is the first segment
  * @return Opaque pointer to first word of allocated segment
  *             0x1000 0000…0000 on failur
  *             0x0100 0000…0000 if too many segments
 **/
-shared_t alloc_segment(shared_t shared, size_t size, bool first)
+shared_t alloc_segment(shared_t shared, size_t size, size_t align, bool first)
 {
     struct region* region = (struct region*) shared;
     // Get segment ID
     uint8_t seg_id;
     acquire(&(region->top_lock));
     if (first) { // Non-free-able first segment
-        seg_id = FIRST_SEG; region->top = FIRST_SEG + 1;
+        seg_id = FIRST_SEG;
+        region->top = FIRST_SEG + 1;
         release(&(region->top_lock));
     }
     else if (unlikely(region->top >= MAX_SEG)) { // Too many segments
         release(&(region->top_lock));
-        return SEG_OVERFLOW;
+        return (shared_t) SEG_OVERFLOW;
     }
     else {
         seg_id = region->segment_id[region->top++];
         release(&(region->top_lock));
     }
-    size_t _align = first ? region->align : region->_align; // Alignment actually used
-    // Compute sizes
-    size_t num_words = size / align;
-    size_t metad_size = sizeof(struct segment_node)
-                      + num_words * sizeof(atomic_flag) // Per-word "access set" guard
-                      + num_words * sizeof(uint64_t);   // Per-word "access set" and written? flag
-    // Allocate memory
+    // Allocate segment node
     struct segment_node* sn;
-    if (unlikely(posix_memalign((void**) &sn, _align,
-                                metad_size + 2 * size) != 0)) { // Allocation failed
-        return NOMEM;
+    if (unlikely(posix_memalign((void**) &sn, align, sizeof(struct segment_node)) != 0)) { // Allocation failed
+        return (shared_t) NOMEM;
+    }
+    // Allocate ctrl structures
+    size_t num_words = size / align;
+    if (unlikely(posix_memalign((void**) &sn->aset_locks, align, num_words * sizeof(atomic_flag)) != 0)) { // Allocation failed
+        free(sn);
+        return (shared_t) NOMEM;
+    }
+    if (unlikely(posix_memalign((void**) &sn->aset, align, num_words * sizeof(uint64_t)) != 0)) { // Allocation failed
+        free(sn->aset_locks); free(sn);
+        return (shared_t) NOMEM;
+    }
+    // Allocate words
+    if (unlikely(posix_memalign((void**) &sn->ro, align, size) != 0)) { // Allocation failed
+        free(sn->aset); free(sn->aset_locks); free(sn);
+        return (shared_t) NOMEM;
+    }
+    if (unlikely(posix_memalign((void**) &sn->rw, align, size) != 0)) { // Allocation failed
+        free(sn->ro); free(sn->aset); free(sn->aset_locks); free(sn);
+        return (shared_t) NOMEM;
     }
     region->allocs[seg_id] = sn; // Register segment in region
-    // Initialize control structures
+    
     sn->seg_id = seg_id;
     sn->size   = size;
-    
-    sn->freed   = ATOMIC_FLAG_INIT;
-    sn->written = ATOMIC_FLAG_INIT;
+    // Initialize control structures
+    atomic_init(&(sn->freed), false);
+    atomic_init(&(sn->written), false);
 
-    sn->aset_locks = (atomic_flag*) (sn + sizeof(struct segment_node));
     for (size_t i = 0; i < num_words; i++) {
-        sn->aset_locks[i] = ATOMIC_FLAG_INIT;
+        atomic_flag_clear(&(sn->aset_locks[i]));
     }
-    sn->aset = (uint64_t*) (sn->aset_locks + num_words * sizeof(atomic_flag));
     memset(sn->aset, 0, num_words * sizeof(uint64_t));
-
-    sn->version = 0;
-    void* segment = (void*) ((uintptr_t) sn + metad_size);    
-    sn->copies[0] = segment;
-    sn->copies[1] = (void*) ((uintptr_t) segment + size);
     // Initialize segment memory
-    memset(segment, 0, 2 * size);
+    memset(sn->ro, 0, size);
+    memset(sn->rw, 0, size);
     // Opaque address
     uintptr_t oaddr = (uintptr_t) seg_id;
     return (shared_t) (oaddr << SHIFT);
@@ -128,32 +132,26 @@ shared_t tm_create(size_t size, size_t align) {
         return invalid_shared;
     }
     // Segment ID stack; must initialize before allocating first segment
-    region->top_lock = ATOMIC_FLAG_INIT;
+    atomic_flag_clear(&region->top_lock);
     region->top = FIRST_SEG; // Segment ID starts from 1.
-    for (size_t i = 0; i < MAX_SEG; i++) {
+    for (uint8_t i = 0; i < MAX_SEG; i++) {
         region->segment_id[i] = i;
     }
-    // Determine alignment; must initialize before allocating first segment
-    region->align  = align;
-    region->_align = align < sizeof(struct segment_node*) ? sizeof(void*) : align; // max{user-defined alignment, pointer size}
-
-    memset(region->allocs, 0, MAX_SEG * sizeof(struct segment_node*)); // Initialize segment list
+    // Initialize segment list
+    memset(region->allocs, 0, MAX_SEG * sizeof(struct segment_node*));
     // Allocate first segment; assume no failure
-    // TODO: region partially initialized?
-    shared_t first = alloc_segment((shared_t) region, size, true);
-    if (unlikely((first == NOMEM) || (first == SEG_OVERFLOW))) { // Allocation failed
+    shared_t first = alloc_segment((shared_t) region, size, align, true);
+    if (unlikely(  ((uint64_t) first == NOMEM)
+                || ((uint64_t) first == SEG_OVERFLOW))) { // Allocation failed
         batcher_cleanup(&(region->batcher)); free(region);
         return invalid_shared;
     }
     // Success: initializa region
     region->start  = first;
     region->size   = size;
-    
+    region->align  = align; // At least 8
+    // Initialize per-TX history
     memset(region->history, 0, MAX_RW_TX * sizeof(struct record*));
-    //memset(region->write, 0, MAX_RW_TX * sizeof(bool));
-    //memset(region->whistory, 0, MAX_RW_TX * sizeof(struct wrecord*));
-    //memset(region->mark, 0, MAX_RW_TX * sizeof(bool));
-    //memset(region->fhistory, 0, MAX_RW_TX * sizeof(struct frecord*));
 
     return (shared_t) region;
 }
@@ -166,14 +164,18 @@ void tm_destroy(shared_t shared) {
     // Clean up batcher
     batcher_cleanup(&(region->batcher));
     // Destroy all segments
+    struct segment_node* sn;
     for (uint8_t i = FIRST_SEG; i < MAX_SEG; i++) {
-        if (region->allocs[i]) { // Segment exists
-            free(region->allocs[i]); // Do not free internal pointers
+        sn = region->allocs[i];
+        if (sn != NULL) { // Segment exists
+            free(sn->aset_locks);
+            free(sn->aset);
+            free(sn->ro);
+            free(sn->rw);
+            free(sn);
         }
     }
-    clear_history(shared); // Clear up all TXs' op history
-    //clear_whistory(shared); // Clear up write history
-    //clear_fhistory(shared); // Clear up free history
+    //clear_history(shared); // Clear up all TXs' op history
     free(region); // Clear up entire region
 }
 
@@ -207,7 +209,11 @@ size_t tm_align(shared_t shared) {
  * @return Opaque transaction ID, 'invalid_tx' on failure
 **/
 tx_t tm_begin(shared_t shared, bool is_ro) {
-    return batcher_enter(&( ((struct region*) shared)->batcher ), is_ro);
+    tx_t tx_id = batcher_enter(&( ((struct region*) shared)->batcher ), is_ro);
+    if (tx_id < MAX_RW_TX) {                              // Futile?
+        ((struct region*) shared)->history[tx_id] = NULL; //
+    }                                                     //
+    return tx_id;
 }
 
 /**
@@ -240,10 +246,9 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
 
     struct region* region = (struct region*) shared;
     struct segment_node* sn = region->allocs[seg_id]; // Segment node
-    int version = sn->version; // RO version
     // RO TX
     if (tx >= MAX_RW_TX) {
-        void* vaddr = (void*) ((uintptr_t) (sn->copies[version]) + offset); // Virtual address
+        void* vaddr = (void*) ((uintptr_t) (sn->ro) + offset); // Virtual address
         memcpy(target, vaddr, size);
         return true;
     }
@@ -257,8 +262,8 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
         acquire(&(sn->aset_locks[i]));
         
         uint64_t bitmap = sn->aset[i];
-        if (!(  (bitmap == (WRITTEN | pattern)) // Word written by current TX
-             || (bitmap < WRITTEN)))            // Word not written
+        if (  (bitmap > WRITTEN)         // Word written
+           && ((bitmap & pattern) == 0)) // Word written by other TX
         {   // Release per-word lock
             for (size_t j = word_idx; j <= i; j++) {
                 release(&(sn->aset_locks[j]));
@@ -267,23 +272,27 @@ bool tm_read(shared_t shared, tx_t tx, void const* source, size_t size, void* ta
             return false; // Abort TX
         }
     }
+    // Read words
+    void* vaddr = (void*) ((uintptr_t) (sn->rw) + offset); // Virtual address
+    memcpy(target, vaddr, size);
     // Configure "access sets"
     // TODO: "access set" update optimization
     for (size_t i = word_idx; i < word_idx + num_words; i++) {
         sn->aset[i] |= pattern;
     }
-    // Read words
-    void* vaddr = (void*) ((uintptr_t) (sn->copies[1 - version]) + offset); // Virtual address
-    memcpy(target, vaddr, size);
     // Release per-word "access set" lock
     for (size_t i = word_idx; i < word_idx + num_words; i++) {
         release(&(sn->aset_locks[i]));
     }
     // Update TX history
-    struct record* r = rw(READ, seg_id, offset, size, region->_align);
+    struct record* r = rw(READ, seg_id, offset, size, region->align);
+    if (unlikely(!r)) {
+        batcher_leave(shared, tx, false);
+        return false;
+    }
     r->next = region->history[tx];
     region->history[tx] = r;
-
+    
     return true;
 }
 
@@ -299,10 +308,9 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
     // Prepare translating opaque target address to virtual address
     uint8_t seg_id = (uint8_t) ((uintptr_t) target >> SHIFT); // Segment ID
     size_t offset = (size_t) ((uintptr_t) target & ADDR_OFFSET); // Opaque address; multiple of `align`
-
+    
     struct region* region = (struct region*) shared;
     struct segment_node* sn = region->allocs[seg_id]; // Segment node
-    int version = sn->version; // RO version
 
     size_t word_idx = offset / region->align; // Starting word index
     size_t num_words = size / region->align;  // No. of words to write
@@ -313,7 +321,9 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
         acquire(&(sn->aset_locks[i]));
 
         uint64_t bitmap = sn->aset[i];
-        if (bitmap & ~WRITTEN & ~pattern > 0) // Word read/written by other TX
+        if (  ((bitmap > WRITTEN) && ((bitmap &  pattern) == 0))  // Word written by other TX
+           || ((bitmap < WRITTEN) && ((bitmap & ~pattern) >  0))) // Word read    by other TX
+        //if (bitmap & ~WRITTEN & ~pattern > 0) // Word read/written by other TX
         {   // Release per-word lock
             for (size_t j = word_idx; j <= i; j++) {
                 release(&(sn->aset_locks[j]));
@@ -322,32 +332,27 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
             return false; // Abort TX
         }
     }
+    // Write words
+    void* vaddr = (void*) ((uintptr_t) (sn->rw) + offset); // Virtual address
+    memcpy(vaddr, source, size);
     // Configure "access sets"
     // TODO: "access set" update optimization
     for (size_t i = word_idx; i < word_idx + num_words; i++) {
         sn->aset[i] |= WRITTEN | pattern;
     }
-    // Write words
-    void* vaddr = (void*) ((uintptr_t) (sn->copies[1 - version]) + offset); // Virtual address
-    memcpy(vaddr, source, size);
     // Release per-word "access set" lock
     for (size_t i = word_idx; i < word_idx + num_words; i++) {
         release(&(sn->aset_locks[i]));
     }
     // Update TX history
-    struct record* r = rw(WRITE, seg_id, offset, size, region->_align);
+    struct record* r = rw(WRITE, seg_id, offset, size, region->align);
+    if (unlikely(!r)) {
+        batcher_leave(shared, tx, false);
+        return false;
+    }
     r->next = region->history[tx];
     region->history[tx] = r;
-    //region->write[tx] = true;
-
-    //struct wrecord* wr;
-    //posix_memalign((void**) &wr, region->_align, sizeof(struct wrecord)); // Assume no failure due to small size
-    //wr->seg_id = seg_id;
-    //wr->offset = offset;
-    //wr->size   = size;
-    // Insert as history head
-    //wr->next = region->whistory[tx];
-    //region->whistory[tx] = wr;
+    
     return true;
 }
 
@@ -359,23 +364,27 @@ bool tm_write(shared_t shared, tx_t tx, void const* source, size_t size, void* t
  * @return Whether the whole transaction can continue (success/nomem), or not (abort_alloc)
 **/
 alloc_t tm_alloc(shared_t shared, tx_t tx, size_t size, void** target) {
+    struct region* region = (struct region*) shared;
     // Allocate segment
-    shared_t oaddr = alloc_segment(shared, size, false);
+    shared_t oaddr = alloc_segment(shared, size, region->align, false);
     // I did not use a `switch` block for the sake of branch prediction hints.
     // Not enough memory
-    if (unlikely(oaddr == NOMEM)) {
+    if (unlikely((uintptr_t) oaddr == NOMEM)) {
         batcher_leave(shared, tx, false); // Leave batch
         return nomem_alloc;               // Abort TX
     }
     // Too many segments
-    else if (unlikely(oaddr == SEG_OVERFLOW)) {
+    else if (unlikely((uintptr_t) oaddr == SEG_OVERFLOW)) {
         batcher_leave(shared, tx, false); // Leave batch
         return abort_alloc;               // Abort TX
     }
     // Success: segment already registered in region
-    struct region* region = (struct region*) shared;
     // Update TX history
-    struct record* r = af(ALLOC, (uint8_t) (oaddr >> SHIFT), region->_align);
+    struct record* r = af(ALLOC, (uint8_t) (((uintptr_t) oaddr) >> SHIFT), region->align);
+    if (unlikely(!r)) {
+        batcher_leave(shared, tx, false);
+        return abort_alloc;
+    }
     r->next = region->history[tx];
     region->history[tx] = r;
 
@@ -395,22 +404,15 @@ bool tm_free(shared_t shared, tx_t tx, void* target) {
         batcher_leave(shared, tx, false); // Leave batch
         return false; // Cannot free first segment, abort TX
     }
-    // TODO: update comment
-    // Mark segment for deregistration by updating free history
-    // If the calling TX aborts, the segment will not be freed.
+    // Update TX history
     struct region* region = (struct region*) shared;
-
-    struct record* r = af(FREE, seg_id, region->_align);
+    struct record* r = af(FREE, seg_id, region->align);
+    if (unlikely(!r)) {
+        batcher_leave(shared, tx, false);
+        return false;
+    }
     r->next = region->history[tx];
     region->history[tx] = r;
-    //region->mark[tx] = true;
-    
-    //struct frecord* fr;
-    //posix_memalign((void**) &fr, region->_align, sizeof(struct frecord)); // Assume no failure due to small size
-    //fr->seg_id = seg_id;
-    // Insert as history head
-    //fr->next = region->fhistory[tx];
-    //region->fhistory[tx] = fr;
 
     return true;
 }

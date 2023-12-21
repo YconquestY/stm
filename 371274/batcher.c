@@ -21,10 +21,6 @@
  * Implementation of declarations in `batcher.h`.
 **/
 
-//#include <stdbool.h>
-
-//#include <tm.h>
-
 #include "macros.h"
 #include "batcher.h"
 
@@ -48,10 +44,6 @@ void batcher_cleanup(struct batcher_t* batcher) {
     pthread_cond_destroy(&batcher->cond);
 }
 
-int batcher_get_epoch(struct batcher_t* batcher) {
-    return batcher->counter;
-}
-
 // Unlike the reference implementation, `batcher_enter` returns the calling TX's
 // ID:
 //     < `MAX_RW_TX`: R/W TX
@@ -68,10 +60,8 @@ tx_t batcher_enter(struct batcher_t* batcher, bool is_ro)
     // of memory operations. Hence, I tuned the zero-in-epoch-op condition as
     // unlikely, and the epoch-unfinished condition as likely.
     if (unlikely(batcher->remaining == 0)) { // First epoch: only 1 thread in batch
-        //printf("epoch: %lu\n", _counter);
         tx_id = is_ro ? (uint64_t) MAX_RW_TX : (uint64_t) 0;
         batcher->remaining = 1;
-        //printf("epoch: %lu\ttx: %lu\texecutes\n", _counter, tx_id);
     }
     else
     {   // Determine TX ID
@@ -80,19 +70,24 @@ tx_t batcher_enter(struct batcher_t* batcher, bool is_ro)
         }
         else if (unlikely(batcher->rw_tx >= MAX_RW_TX)) {
             pthread_mutex_unlock(&batcher->lock);
-            //printf("epoch: %lu\tabort\n", _counter + 1);
             return invalid_tx;
         }
         else {
             tx_id = batcher->rw_tx++;
         }
         batcher->blocked++;
-        //printf("epoch: %lu\tblocked: %lu\n", batcher->counter, batcher->blocked);
+        // Incoming threads block if the current epoch is not complete, i.e.,
+        // there are outstanding TXs in the current batch. It is natural to
+        // write
+        //     `while (batcher->remaining > 0) {…}`
+        // However, it will not work because `pthread_cond_broadcast` is not
+        // called until `batcher->remaining == 0`. By the time waiting threads
+        // re-acquire the lock, `batcher->remaining` is already set as
+        // `batcher->blocked` (previous epoch). The condition is TRUE again!
+        // Then thses threads keep waiting — disaster!
         while (likely(_counter == batcher->counter)) {
-            //printf("epoch: %lu\ttx: %lu\twaits\n", _counter + 1, tx_id);
             pthread_cond_wait(&batcher->cond, &batcher->lock);
         }
-        //printf("tx: %lu\twoken\n", tx_id);
     }
     pthread_mutex_unlock(&batcher->lock);
     return tx_id;
@@ -100,7 +95,6 @@ tx_t batcher_enter(struct batcher_t* batcher, bool is_ro)
 
 void batcher_leave(shared_t shared, tx_t tx, bool committed)
 {
-    //printf("tx: %lu\t%s\n", tx, committed ? "commits" : "aborts");
     struct region* region = (struct region*) shared;
     struct batcher_t* batcher = &region->batcher;
     // Handle R/W TX history
@@ -110,6 +104,7 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
     {
         struct record* r = region->history[tx];
         struct record* next;
+        //while (r)
         while (r != NULL) // R/W TX: Non-empty history
         {
             switch (r->type)
@@ -149,12 +144,12 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
                             acquire(&(sn->aset_locks[word_idx]));
                         }
                         memcpy(rw_addr, ro_addr, r->rwop.size); // Rollback words from RO to R/W
-                        // // Reset per-word "access set"
-                        // // It is safe to reset "access sets" to 0. No other TX can
-                        // // access the word after is has been written. Hence, the
-                        // // only pattern of `aset[…]` is
-                        // //     0b1000 0000…0010…0000
-                        // //       ^ Written   ^ TX that wrote
+                        // Reset per-word "access set"
+                        // It is safe to reset "access sets" to 0. No other TX can
+                        // access the word after is has been written. Hence, the
+                        // only pattern of `aset[…]` is
+                        //     0b1000 0000…0010…0000
+                        //       ^ Written   ^ TX that wrote
                         // memset(sn->aset + start_idx * sizeof(uint64_t), 0, num_words * sizeof(uint64_t));
                         for (size_t word_idx = start_idx; word_idx < start_idx + num_words; word_idx++) {
                             sn->aset[word_idx] &= ~(WRITTEN & ((uint64_t) 1 << tx));
@@ -168,13 +163,11 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
                 case ALLOC:
                     if (unlikely(!(committed))) {
                         atomic_store(&(region->allocs[r->afop.seg_id]->freed), true);
-                        //printf("tx %lu marks segment %u\n", tx, r->afop.seg_id);
                     }
                     break;
                 case FREE:
-                    if (committed) {
+                    if (likely(committed)) {
                         atomic_store(&(region->allocs[r->afop.seg_id]->freed), true);
-                        //printf("tx %lu marks segment %u\n", tx, r->afop.seg_id);
                     }
                     break;
                 default:
@@ -200,6 +193,7 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
         {
             sn = region->allocs[i]; // Pointer to segment
             // Short circuit if segment does not exist
+            //if (!(sn)) {
             if (sn == NULL) {
                 continue;
             }
@@ -213,17 +207,25 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
                 free(sn->rw);
                 free(sn);
                 region->allocs[i] = NULL; // Deregister segment from region
-                //printf("segment %u freed\n", i);
             }
             else // Segment not freed; may have been written
             {
                 size_t num_words = sn->size / region->align;
-                // // Segment confirmed written
-                // // TODO: word swap optimization
+                // Segment confirmed written
+                // TODO: word swap optimization
                 if (atomic_load(&(sn->written)))
                 {   // Reset written? flag
                     atomic_store(&(sn->written), false);
-                    
+                    // There are 2 ways to swap words of a written segment:
+                    //
+                    // 1. Naively swap all words
+                    // 2. Only swap written words
+                    //
+                    // While 1 incurs mhigher memory traffic. 2 induces written
+                    // ranges compute overhead. Neither may 2 fully coalesce
+                    // memory accesses. The tradeoff depends on characteristics
+                    // of the workload.
+
                     // size_t start, end; // Interval [`start`,`end`) written
                     // for (size_t word_idx = 0; word_idx < num_words; /* inside loop body */)
                     // {
@@ -249,12 +251,11 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
             }
         }
         memset(region->history, 0, MAX_RW_TX * sizeof(struct record*)); // Reset TX history
-        batcher->counter++;         // Set next epoch ID
+        batcher->counter++;         // Proceed to next epoch
         batcher->rw_tx = 0;         // Reset R/W TX ID
         batcher->ro_tx = MAX_RW_TX; // Reset RO  TX ID
         batcher->remaining = batcher->blocked; // Better set before waking up threads
         batcher->blocked = 0; // Must reset before releasing lock
-        //printf("epoch: %lu\n", batcher->counter);
         pthread_cond_broadcast(&batcher->cond);
     }
     pthread_mutex_unlock(&batcher->lock);
@@ -264,11 +265,11 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
  * 2. Use `atomic_flag` as lock *
  ********************************/
 
-/*static inline*/ void acquire(atomic_flag* lock) {
+inline void acquire(atomic_flag* lock) {
     while (atomic_flag_test_and_set(lock)); // Spin
 }
 
-/*static inline*/ void release(atomic_flag* lock) {
+inline void release(atomic_flag* lock) {
     atomic_flag_clear(lock);
 }
 
@@ -306,6 +307,7 @@ struct record* af(op_t type, uint8_t seg_id, size_t align)
     return r;
 }
 
+// This function is not necessary.
 void clear_history(shared_t shared)
 {
     struct region* region = (struct region*) shared;
@@ -321,43 +323,3 @@ void clear_history(shared_t shared)
         }
     }
 }
-
-// TODO: avoid table traversal for unassigned TX IDs
-// void clear_whistory(shared_t shared)
-// {
-//     struct region* region = (struct region*) shared;
-
-//     struct wrecord* wr, next;
-//     for (size_t i = 0; i < MAX_RW_TX; i++)
-//     {
-//         if (region->write[i]) // Linked list exists
-//         {
-//             wr = region->whistory[i];
-//             while (wr) {
-//                 next = wr->next;
-//                 free(wr);
-//                 wr = next;
-//             }
-//         }
-//     }
-// }
-
-// TODO: avoid table traversal for unassigned TX IDs
-// void clear_fhistory(shared_t shared)
-// {
-//     struct region* region = (struct region*) shared;
-
-//     struct frecord* fr, next;
-//     for (size_t i = 0; i < MAX_RW_TX; i++)
-//     {
-//         if (region->mark[i]) // Linked list exists
-//         {
-//             fr = region->fhistory[i];
-//             while (fr) {
-//                 next = fr->next;
-//                 free(fr);
-//                 fr = next;
-//             }
-//         }
-//     }
-// }
