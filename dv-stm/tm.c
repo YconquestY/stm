@@ -1,6 +1,6 @@
 /**
  * @file   tm.c
- * @author Yue Yu <yue.yu@epfl.ch>
+ * @author Will Yu <?@epfl.ch>
  *
  * @section LICENSE
  * 
