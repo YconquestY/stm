@@ -28,7 +28,7 @@ Note that reads and writes are always through a (temporary) buffer. Bytes are di
 
 DV-STM is already specified [here](https://dcl.epfl.ch/site/_media/education/ca-project.pdf). It is logically laid out as below.
 
-![Logical layout](https://github.com/YconquestY/stm/blob/main/371274/assets/layout.png)
+![Logical layout](https://github.com/YconquestY/stm/blob/main/dv-stm/assets/layout.png)
 
 A shared memory *region* contains several variable-size *segments*, as well as the corresponding control structures. Each segment holds variable-number *words*. A memory word holds `align` bytes.
 
@@ -40,7 +40,7 @@ The control structures include a thread batcher, a stack to assign IDs to alloca
 
 The illustration below details the layout of a memory region.
 
-![Region implementation](https://github.com/YconquestY/stm/blob/main/371274/assets/region.png)
+![Region implementation](https://github.com/YconquestY/stm/blob/main/dv-stm/assets/region.png)
 
 The DV-STM library itself does **not** spawn threads. Instead, the library users may create multiple threads accessing the shared region. Each user thread may contain $1$ or more transaction. Transactions are categorized as read-only ones (RO TXs) and read-write ones (R/W TXs). RO TXs access the read-only version of a segment, whereas R/W TXs access the read-write version of a segment.
 
@@ -48,7 +48,7 @@ TXs execute in *epochs*. In every epoch, a *batch* of TX (blocked in the previou
 
 With a word address, multiple TXs may access a segment concurrently. I implemented another abstraction of *opaque address* over the (virtual) process address space, which is illustrated below.
 
-![Opaque address](https://github.com/YconquestY/stm/blob/main/371274/assets/void_.png)
+![Opaque address](https://github.com/YconquestY/stm/blob/main/dv-stm/assets/void_.png)
 
 By [spec](https://dcl.epfl.ch/site/_media/education/ca-project.pdf), a segment holds $\le 2^{48}$ bytes, addressing which will require $48$ bits. In contrast, a `void*` is $64$ bits, which means there are $2$ bytes unused! I let $6$ bits (bits $48 \rightarrow 53$) to represent the segment ID. In this way, given an arbitrary opaque address, I may know 1) which segment it refers to, as well as 2) the offset from the first word in the segment. Bits $54 \rightarrow 63$ are still "wasted". As an optimization, they may be flags for invalidities.
 
@@ -60,11 +60,11 @@ All operations in a R/W TX prior to the abort point must be rolled back. Otherwi
 
 The illustration below details the layout of a segment.
 
-![Segment implementation](https://github.com/YconquestY/stm/blob/main/371274/assets/segment.png)
+![Segment implementation](https://github.com/YconquestY/stm/blob/main/dv-stm/assets/segment.png)
 
 A segment comprises a read-only version of words, a read-write version, and per-word control structures.
 
-![Per-word control](https://github.com/YconquestY/stm/blob/main/371274/assets/aset.png)
+![Per-word control](https://github.com/YconquestY/stm/blob/main/dv-stm/assets/aset.png)
 
 A memory word is primarily controlled by an *access set* (illustrated above). An access set is an `uint64_t` flag. As [aforementioned](#shared-memory-region), each batch supports up to $63$ R/W TX, each cooresponding to a bit in an `uint64_t`. In bits $0 \rightarrow 62$, a bit is set to $\verb|1|$ whenever a R/W TX accesses the word. Bit $63$ is reserved to imply whether a word has been written.
 
@@ -86,6 +86,6 @@ A memory word is primarily controlled by an *access set* (illustrated above). An
 
 - A taste of C atomics
   - How to use an `atomic_flag` as a lock
-- Compiler hints (see [`macros.h`](https://github.com/YconquestY/stm/blob/main/371274/macros.h))
+- Compiler hints (see [`macros.h`](https://github.com/YconquestY/stm/blob/main/dv-stm/macros.h))
 - Spotting segmentation faults with gdb
 - Detecting memory leak with Valgrind
