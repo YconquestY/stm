@@ -1,27 +1,51 @@
-# CS-453 - Course project
+# DV-STM
 
-The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) is available on [Moodle](https://moodle.epfl.ch/course/view.php?id=14334) and the [website of the course](https://dcl.epfl.ch/site/education/ca_2021).
+A dual-versioned **software transactional memory** library with over $3 \times$ speedup against the reference implementation using a coarse-grained lock.
 
-The description includes:
-* an introduction to (software) transactional memory
-* an introduction to concurrent programming in C11/C++11, with pointers to more resources
-* the _specifications_ of the transactional memory you have to implement, i.e. both:
-  * sufficient properties for a transactional memory to be deemed _correct_
-  * a thorough description of the transactional memory interface
-* practical informations, including:
-  * how to test your implementation on your local machine and on the evaluation server
-  * how your submission will be graded
-  * rules for (optionally) using 3rd-party libraries and collaboration (although the project is _individual_)
+## TODO
 
-This repository provides:
-* examples of how to use synchronization primitives (in `sync-examples/`)
-* a reference implementation (in `reference/`)
-* a "skeleton" implementation (in `template/`)
-  * this template is written in C11
-  * feel free to overwrite it completely if you prefer to use C++ (in this case include `<tm.hpp>` instead of `<tm.h>`)
-* the program that will test your implementation (in `grading/`)
-  * the same program will be used on the evaluation server (although possibly with a different seed)
-  * you can use it to test/debug your implementation on your local machine (see the [description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf))
-* a tool to submit your implementation (in `submit.py`)
-  * you should have received by mail a secret _unique user identifier_ (UUID)
-  * see the [description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) for more information
+- [ ] To understand the difference between `inline …` and `static inline …`<br>
+  and why
+  ```
+  cc -Wall -Wextra -Wfatal-errors -O2 -std=c11 -fPIC -I../include -c -o batcher.c.o batcher.c
+  batcher.c:268:20: error: static declaration of ‘acquire’ follows non-static declaration
+    268 | static inline void acquire(atomic_flag* lock) {
+        |                    ^~~~~~~
+  compilation terminated due to -Wfatal-errors.
+  ```
+- [ ] To understand the behavior of [`posix_memalign(…)`](https://man7.org/linux/man-pages/man3/posix_memalign.3.html) regarding virtual address and alignment
+- [ ] To understand dynamic allocation of `struct` with `union`
+- [ ] To optimize "access sets" update<br>
+  Currently, per-word "access sets" are always updated during each read/write operation even though it is **not** necessary to do so.
+- [ ] To understand synchronization examples in [`sync-examples/`](https://github.com/YconquestY/stm/tree/main/sync-examples)
+- [ ] To understand examples in [`playground/`](https://github.com/YconquestY/stm/tree/main/playground)
+- [ ] To understand the workload and how an implementation is graded in [`grading/`](https://github.com/YconquestY/stm/tree/main/grading)
+
+## Introduction
+
+The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.pdf) includes
+
+- An introduction to STM;
+- The specifications of the STM implemented;
+  - Sufficient properties for an STM to be deemed correct
+  - The DV-STM algorithm
+  - A thorough description of the STM interface
+- Practical information.
+  - How to test an implementation locally
+  - The performance metric
+
+## Directory organization
+
+| Directory | Description |
+| ---       | ---         |
+| [`dv-stm/`](https://github.com/YconquestY/stm/tree/main/dv-stm) | DV-STM implementation |
+| [`grading/`](https://github.com/YconquestY/stm/tree/main/grading) | Workload and grader |
+| [`include/`](https://github.com/YconquestY/stm/tree/main/include) | STM API |
+| [`playground/`](https://github.com/YconquestY/stm/tree/main/playground) | Unknown |
+| [`reference/`](https://github.com/YconquestY/stm/tree/main/reference) | A reference implementation using a coarse-grained lock |
+| [`sync-examples/`](https://github.com/YconquestY/stm/tree/main/sync-examples) | Examples on synchronization primitives |
+| [`submit.py`](https://github.com/YconquestY/stm/blob/main/submit.py) | Autograding submission script |
+
+## Acknowledgement
+
+This project is the coursework of [CS-453](https://dcl.epfl.ch/site/education/ca_2023) by [École Polytechnique Fédérale de Lausanne](https://www.epfl.ch) (EPFL).
