@@ -48,4 +48,4 @@ The [project description](https://dcl.epfl.ch/site/_media/education/ca-project.p
 
 ## Acknowledgement
 
-This project is the coursework of [CS-453](https://dcl.epfl.ch/site/education/ca_2023) by [École Polytechnique Fédérale de Lausanne](https://www.epfl.ch) (EPFL).
+This project is the coursework of [CS-453](https://dcl.epfl.ch/site/education/ca_2023) *Concurrenct Computing* by [École Polytechnique Fédérale de Lausanne](https://www.epfl.ch) (EPFL).
