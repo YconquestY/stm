@@ -266,11 +266,11 @@ void batcher_leave(shared_t shared, tx_t tx, bool committed)
  ********************************/
 
 inline void acquire(atomic_flag* lock) {
-    while (atomic_flag_test_and_set(lock)); // Spin
+    while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire)); // Spin
 }
 
 inline void release(atomic_flag* lock) {
-    atomic_flag_clear(lock);
+    atomic_flag_clear_explicit(lock, memory_order_release);
 }
 
 /*************************************
